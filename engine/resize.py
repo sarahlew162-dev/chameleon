@@ -6,7 +6,11 @@ rearrange into a row or column when it isn't. Same elements, no stretching.
 """
 
 from copy import deepcopy
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+from PIL import ImageFont
 
 # --- knobs you may want to tweak -------------------------------------------
 RATIO_BOUNDARY = 1.35   # how far aspect may drift before we rearrange
@@ -77,6 +81,13 @@ def _similar(elements, sw, sh, tw, th, s, sx, sy):
 # --- past the boundary: rearrange --------------------------------------------
 
 def _row(elements, sw, sh, tw, th):
+    if tw / th >= 1.0:
+        if tw / th <= 1.3:
+            _compose_portrait(elements, sw, sh, tw, th)
+        else:
+            _compose_banner(elements, sw, sh, tw, th)
+        return
+
     """Wide/short canvas: use a half-width image panel with readable overlays."""
     if th <= 160:
         margin = max(2.0, th * 0.02)
@@ -256,6 +267,357 @@ def _row(elements, sw, sh, tw, th):
         _place_text_column(texts, x, margin, text_w, inner_h)
 
 
+def _compose_banner(elements, sw, sh, tw, th):
+    bgs, units = _units(elements, sw, sh)
+    _fill_bgs(bgs, tw, th)
+
+    logos = [unit for unit in units if _is_logo(unit)]
+    content = [unit for unit in units if unit not in logos]
+    images = [
+        unit for unit in content
+        if len(unit["members"]) == 1
+        and unit["members"][0]["type"] == "image"
+    ]
+    hero = max(images, key=lambda unit: unit["w"] * unit["h"], default=None)
+    if hero is not None:
+        content.remove(hero)
+
+    all_text_units = [unit for unit in content if unit["is_text"]]
+    text_units = list(all_text_units)
+    legal = [unit for unit in text_units if _is_legal(unit)]
+    text_units = [unit for unit in text_units if unit not in legal]
+    heading = max(
+        text_units,
+        key=lambda unit: max(
+            float(member.get("font_size", 0)) for member in unit["members"]
+        ),
+        default=None,
+    )
+    paragraphs = sorted(
+        (unit for unit in text_units if unit is not heading),
+        key=lambda unit: (unit["y"], unit["x"]),
+    )
+    controls = [
+        unit for unit in content
+        if not unit["is_text"]
+        and any(member["type"] == "text" for member in unit["members"])
+    ]
+    decorations = [
+        unit for unit in content
+        if unit not in controls and unit not in images and unit not in all_text_units
+    ]
+
+    if th <= 160:
+        _compose_short_banner(
+            tw, th, logos, hero, images, controls, heading, paragraphs,
+            legal, decorations,
+        )
+        return
+
+    margin = max(8.0, min(tw, th) * 0.06)
+    left_x = margin
+    left_w = tw * 0.50
+    hero_x = tw * 0.61
+    hero_w = tw * 0.27
+    hero_h = th * 0.88
+    hero_y = (th - hero_h) / 2.0
+    if hero is not None:
+        _place_image_unit(hero, hero_x, hero_y, hero_w, hero_h)
+
+    if logos:
+        logo = max(logos, key=lambda unit: unit["w"] * unit["h"])
+        _place_image_unit(
+            logo, tw - margin - tw * 0.16, margin * 0.45,
+            tw * 0.16, min(th * 0.18, 72.0),
+        )
+        logos.remove(logo)
+    for index, logo in enumerate(logos):
+        _place_image_unit(
+            logo, tw - margin - tw * 0.16,
+            margin * 0.45 + (index + 1) * min(th * 0.18, 72.0),
+            tw * 0.16, min(th * 0.18, 72.0),
+        )
+
+    remaining_images = [unit for unit in images if unit is not hero]
+    for index, image in enumerate(remaining_images):
+        _place_image_unit(
+            image, tw - margin - 48.0, th * 0.42 + index * 52.0, 40.0, 40.0
+        )
+
+    top_controls = sorted(
+        (unit for unit in controls if not _is_call_to_action(unit)),
+        key=lambda unit: (unit["x"], unit["y"]),
+    )
+    calls_to_action = [
+        unit for unit in controls if _is_call_to_action(unit)
+    ]
+    if not calls_to_action and controls:
+        calls_to_action = [max(controls, key=lambda unit: unit["y"])]
+        top_controls = [unit for unit in controls if unit not in calls_to_action]
+
+    control_y = margin * 0.5
+    control_h = min(46.0, th * 0.13)
+    control_gap = 12.0
+    control_w = min(220.0, (left_w - control_gap * max(0, len(top_controls) - 1)) /
+                    max(1, len(top_controls)))
+    for index, unit in enumerate(top_controls):
+        _place_group_unit(
+            unit, left_x + index * (control_w + control_gap), control_y,
+            control_w, control_h,
+        )
+
+    title_y = margin + control_h + 18.0
+    title_h = min(th * 0.25, 100.0)
+    if heading is not None:
+        _place_text_unit(
+            heading, left_x, title_y, left_w, title_h,
+            max_size=min(56.0, _unit_font_size(heading)),
+            min_size=8.0 if tw < 500 else 14.0,
+        )
+
+    cta_y = th - margin - min(66.0, th * 0.18)
+    cta_h = min(66.0, th * 0.18)
+    cta_w = min(340.0, left_w * 0.65)
+    for index, unit in enumerate(calls_to_action):
+        _place_group_unit(
+            unit, left_x + index * (cta_w + control_gap),
+            cta_y, cta_w, cta_h,
+        )
+
+    paragraph_top = title_y + title_h + 8.0
+    paragraph_bottom = cta_y - 10.0
+    paragraph_h = max(1.0, (paragraph_bottom - paragraph_top) /
+                      max(1, len(paragraphs)))
+    for index, unit in enumerate(paragraphs):
+        _place_text_unit(
+            unit, left_x, paragraph_top + index * paragraph_h,
+            left_w, paragraph_h,
+            max_size=min(24.0, _unit_font_size(unit)),
+            min_size=6.0 if tw < 500 else 8.0,
+        )
+
+    for index, unit in enumerate(legal):
+        _place_text_unit(
+            unit, margin, th - max(16.0, margin * 0.45) - index * 18.0,
+            tw * 0.48, 16.0, max_size=12.0, min_size=7.0,
+        )
+
+    for index, unit in enumerate(decorations):
+        size = min(96.0, th * 0.24, max(unit["w"], unit["h"]) * 0.25)
+        x = hero_x - size * 0.45 if index % 2 == 0 else hero_x + hero_w - size * 0.55
+        y = hero_y + index * size * 0.55
+        _place_group_unit(unit, x, y, size, size)
+
+
+def _compose_short_banner(
+    tw, th, logos, hero, images, controls, heading, paragraphs, legal,
+    decorations,
+):
+    margin = max(2.0, th * 0.025)
+    if tw <= 400:
+        title_y, title_h = margin, th * 0.24
+        paragraph_y, paragraph_h = th * 0.26, th * 0.26 / max(1, len(paragraphs))
+        text_w = tw * 0.83 - margin
+        hero_x, hero_w = tw * 0.86, tw * 0.08
+        logo_w, logo_h = tw * 0.08, th * 0.12
+        control_y, control_h = th * 0.57, th * 0.30
+        legal_y = th * 0.88
+    else:
+        title_y, title_h = margin, th * 0.54
+        paragraph_y, paragraph_h = margin, th * 0.54 / max(1, len(paragraphs))
+        text_w = tw * 0.39
+        hero_x, hero_w = tw * 0.45, tw * 0.08
+        logo_w, logo_h = tw * 0.10, th * 0.22
+        control_y, control_h = th * 0.60, th * 0.27
+        legal_y = th * 0.89
+
+    if hero is not None:
+        _place_image_unit(hero, hero_x, th * 0.27, hero_w, th * 0.31)
+    for index, logo in enumerate(logos):
+        _place_image_unit(
+            logo, tw - margin - logo_w, margin + index * (logo_h + 1.0),
+            logo_w, logo_h,
+        )
+
+    if heading is not None:
+        _place_text_unit(
+            heading, margin, title_y, text_w, title_h,
+            max_size=min(14.0, _unit_font_size(heading)), min_size=3.5,
+        )
+    for index, unit in enumerate(paragraphs):
+        x = margin if tw <= 400 else tw * 0.56
+        width = text_w if tw <= 400 else tw * 0.30
+        _place_text_unit(
+            unit, x, paragraph_y + index * paragraph_h,
+            max(1.0, width), paragraph_h,
+            max_size=min(10.0, _unit_font_size(unit)), min_size=3.5,
+        )
+
+    for index, image in enumerate(unit for unit in images if unit is not hero):
+        _place_image_unit(
+            image, tw * 0.96 - index * th * 0.13,
+            th * 0.35, th * 0.035, th * 0.13,
+        )
+
+    control_h = max(1.0, control_h)
+    control_gap = max(1.0, tw * 0.006)
+    cell_w = max(
+        1.0,
+        (tw - 2.0 * margin - control_gap * max(0, len(controls) - 1)) /
+        max(1, len(controls)),
+    )
+    for index, unit in enumerate(sorted(controls, key=lambda item: (item["y"], item["x"]))):
+        for member in unit["members"]:
+            member["rotation"] = 0
+        _place_group_unit(
+            unit, margin + index * (cell_w + control_gap),
+            control_y, cell_w, control_h,
+        )
+
+    legal_h = max(1.0, th - legal_y - margin)
+    for index, unit in enumerate(legal):
+        _place_text_unit(
+            unit, margin, legal_y - index * legal_h, tw - 2.0 * margin,
+            legal_h, max_size=6.0,
+            min_size=3.0 if tw <= 400 and th <= 60 else 4.0,
+        )
+
+    for index, unit in enumerate(decorations):
+        size = max(1.0, min(th * 0.12, tw * 0.04))
+        _place_group_unit(
+            unit, hero_x - size * 0.25, margin + index * size * 0.4,
+            size, size,
+        )
+
+
+def _place_image_unit(unit, x, y, w, h):
+    member = unit["members"][0]
+    aspect = float(member["width"]) / max(float(member["height"]), 1e-6)
+    image_w = min(w, h * aspect)
+    image_h = image_w / max(aspect, 1e-6)
+    member["x"] = x + (w - image_w) / 2.0
+    member["y"] = y + (h - image_h) / 2.0
+    member["width"], member["height"] = image_w, image_h
+    member["fit"] = "contain"
+
+
+def _place_group_unit(unit, x, y, w, h):
+    _place_unit(unit, x, y, w, h)
+    for member in unit["members"]:
+        if member["type"] == "text":
+            minimum = 3.0 if w <= 400 and h <= 60 else min(
+                4.0, float(member["font_size"])
+            )
+            _fit_text_to_box(
+                member, member["x"], member["y"], member["width"],
+                member["height"], max_size=float(member["font_size"]),
+                min_size=minimum,
+            )
+
+
+def _place_text_unit(unit, x, y, w, h, max_size, min_size):
+    if len(unit["members"]) == 1:
+        _fit_text_to_box(unit["members"][0], x, y, w, h, max_size, min_size)
+    else:
+        _place_unit(unit, x, y, w, h)
+        for member in unit["members"]:
+            _fit_text_to_box(
+                member, member["x"], member["y"], member["width"],
+                member["height"], float(member["font_size"]),
+                min(min_size, float(member["font_size"])),
+            )
+
+
+def _fit_text_to_box(element, x, y, w, h, max_size, min_size):
+    element["x"], element["y"] = x, y
+    element["width"], element["height"] = max(1.0, w), max(1.0, h)
+    desired = max(1.0, min(float(element.get("font_size", max_size)), max_size))
+    minimum = max(1.0, min(desired, min_size))
+    low, high = minimum, desired
+    for _ in range(16):
+        size = (low + high) / 2.0
+        if _text_fits(element, size, element["width"], element["height"]):
+            low = size
+        else:
+            high = size
+    element["font_size"] = max(minimum, low)
+
+
+def _text_fits(element, size, width, height):
+    font = _layout_font(
+        str(element.get("font_family", "Solstice Sans")),
+        str(element.get("font_weight", "regular")),
+        str(element.get("font_style", "normal")),
+        max(1, round(size)),
+    )
+    content = str(element.get("content", ""))
+    lines = 0
+    for paragraph in content.split("\n"):
+        line_width = 0.0
+        for word in paragraph.split(" "):
+            word_width = font.getlength(word)
+            next_width = line_width + (font.getlength(" ") if line_width else 0.0) + word_width
+            if line_width and next_width > width * 0.96:
+                lines += 1
+                line_width = word_width
+            else:
+                line_width = next_width
+        lines += 1
+    line_height = float(element.get("line_height", 1.2))
+    max_lines = element.get("max_lines")
+    return (
+        lines * size * line_height <= height
+        and (max_lines is None or lines <= int(max_lines))
+    )
+
+
+@lru_cache(maxsize=256)
+def _layout_font(family, weight, style, size):
+    family_name = "".join(str(family).split()).lower()
+    prefix = "SolsticeSerif" if "serif" in family_name else "SolsticeSans"
+    bold = str(weight).lower() in {"bold", "semibold", "extrabold", "black"}
+    italic = str(style).lower() == "italic"
+    suffix = "Bold" if bold else "Regular"
+    if italic:
+        suffix += "Italic"
+    font_path = (
+        Path(__file__).resolve().parent.parent
+        / "brand_kit" / "fonts" / f"{prefix}-{suffix}.ttf"
+    )
+    if not font_path.is_file():
+        font_path = font_path.with_name(f"{prefix}-Regular.ttf")
+    return ImageFont.truetype(str(font_path), size)
+
+
+def _unit_font_size(unit):
+    return max(
+        (float(member.get("font_size", 12.0)) for member in unit["members"]),
+        default=12.0,
+    )
+
+
+def _unit_text(unit):
+    return " ".join(
+        str(member.get("content", "")) for member in unit["members"]
+        if member["type"] == "text"
+    ).lower()
+
+
+def _unit_ids(unit):
+    return " ".join(str(member.get("id", "")) for member in unit["members"]).lower()
+
+
+def _is_call_to_action(unit):
+    text = _unit_text(unit)
+    return any(token in text for token in ("shop", "buy", "order", "visit", "learn more"))
+
+
+def _is_legal(unit):
+    text = _unit_text(unit)
+    ids = " ".join(str(member.get("id", "")) for member in unit["members"]).lower()
+    return "legal" in ids or "responsibly" in text or "void where prohibited" in text
+
+
 def _place_compact_unit(unit, x, y, w, h):
     for member in unit["members"]:
         if float(member.get("rotation", 0)):
@@ -395,6 +757,10 @@ def _place_short_banner(hero, backgrounds, units, heading, paragraph, legal, tw,
 
 def _column(elements, sw, sh, tw, th):
     """Tall canvas: pin the logo, then stack content in responsive grid rows."""
+    if tw / th <= 0.68:
+        _compose_portrait(elements, sw, sh, tw, th)
+        return
+
     margin = max(8.0, min(tw, th) * MARGIN_FRAC)
     gap = max(6.0, min(tw, th) * GAP_FRAC)
     inner_w, inner_h = tw - 2 * margin, th - 2 * margin
@@ -463,6 +829,141 @@ def _column(elements, sw, sh, tw, th):
                 x = margin + (inner_w - w) / 2.0
             _place_unit(unit, x, y, w, h)
         y += h + gap
+
+
+def _compose_portrait(elements, sw, sh, tw, th):
+    bgs, units = _units(elements, sw, sh)
+    _fill_bgs(bgs, tw, th)
+
+    logos = [unit for unit in units if _is_logo(unit)]
+    content = [unit for unit in units if unit not in logos]
+    images = [
+        unit for unit in content
+        if len(unit["members"]) == 1
+        and unit["members"][0]["type"] == "image"
+    ]
+    hero = max(images, key=lambda unit: unit["w"] * unit["h"], default=None)
+    if hero is not None:
+        content.remove(hero)
+
+    text_units = [unit for unit in content if unit["is_text"]]
+    legal = [unit for unit in text_units if _is_legal(unit)]
+    text_units = [unit for unit in text_units if unit not in legal]
+    heading = max(
+        text_units,
+        key=lambda unit: max(
+            float(member.get("font_size", 0)) for member in unit["members"]
+        ),
+        default=None,
+    )
+    paragraphs = sorted(
+        (unit for unit in text_units if unit is not heading),
+        key=lambda unit: (unit["y"], unit["x"]),
+    )
+    controls = [
+        unit for unit in content
+        if not unit["is_text"]
+        and any(member["type"] == "text" for member in unit["members"])
+    ]
+    calls_to_action = [unit for unit in controls if _is_call_to_action(unit)]
+    other_controls = [unit for unit in controls if unit not in calls_to_action]
+    ribbons = [
+        unit for unit in other_controls
+        if "ribbon" in _unit_ids(unit) or "sale" in _unit_text(unit)
+    ]
+    badges = [unit for unit in other_controls if unit not in ribbons]
+    decorations = [
+        unit for unit in content
+        if unit not in controls and unit not in images and unit not in text_units
+        and unit not in legal
+    ]
+    remaining_images = [unit for unit in images if unit is not hero]
+
+    margin = max(10.0, min(tw, th) * 0.05)
+    for index, logo in enumerate(logos):
+        logo_w = tw * 0.30
+        logo_h = min(th * 0.055, logo_w / max(logo["w"] / max(logo["h"], 1.0), 1e-6))
+        _place_image_unit(
+            logo, (tw - logo_w) / 2.0, margin * 0.35 + index * (logo_h + 2.0),
+            logo_w, logo_h,
+        )
+
+    for index, ribbon in enumerate(ribbons):
+        ribbon_w = tw * 0.46
+        _place_group_unit(
+            ribbon, margin, th * 0.075 + index * th * 0.07,
+            ribbon_w, th * 0.065,
+        )
+
+    hero_y = th * 0.14
+    hero_h = th * 0.21
+    if hero is not None:
+        _place_image_unit(hero, tw * 0.36, hero_y, tw * 0.28, hero_h)
+    for index, image in enumerate(remaining_images):
+        image_size = min(tw * 0.12, th * 0.05)
+        _place_image_unit(
+            image, tw - margin - image_size, th * 0.24 + index * image_size,
+            image_size, image_size,
+        )
+
+    title_y = th * 0.34
+    title_h = th * 0.15
+    if heading is not None:
+        _place_text_unit(
+            heading, margin, title_y, tw - 2.0 * margin, title_h,
+            max_size=min(32.0, _unit_font_size(heading)), min_size=9.0,
+        )
+
+    paragraph_y = th * 0.49
+    paragraph_h = th * 0.15 / max(1, len(paragraphs))
+    for index, unit in enumerate(paragraphs):
+        _place_text_unit(
+            unit, margin, paragraph_y + index * paragraph_h,
+            tw - 2.0 * margin, paragraph_h,
+            max_size=min(18.0, _unit_font_size(unit)), min_size=7.0,
+        )
+
+    badge_rows = [
+        badges[index:index + 3] for index in range(0, len(badges), 3)
+    ]
+    badge_y = th * 0.63
+    badge_h = max(20.0, th * 0.10)
+    badge_gap = max(4.0, tw * 0.02)
+    for row_index, row in enumerate(badge_rows):
+        cell_w = (tw - 2.0 * margin - badge_gap * max(0, len(row) - 1)) / len(row)
+        for column, unit in enumerate(row):
+            _place_group_unit(
+                unit, margin + column * (cell_w + badge_gap),
+                badge_y + row_index * (badge_h + badge_gap),
+                cell_w, badge_h,
+            )
+
+    cta_y = th * 0.81
+    cta_h = th * 0.085
+    cta_gap = max(6.0, tw * 0.025)
+    cta_w = min(tw * 0.72, (tw - 2.0 * margin - cta_gap * max(0, len(calls_to_action) - 1)) /
+                max(1, len(calls_to_action)))
+    for index, unit in enumerate(calls_to_action):
+        _place_group_unit(
+            unit, (tw - (len(calls_to_action) * cta_w +
+                         max(0, len(calls_to_action) - 1) * cta_gap)) / 2.0
+            + index * (cta_w + cta_gap),
+            cta_y, cta_w, cta_h,
+        )
+
+    legal_y = th * 0.92
+    legal_h = max(1.0, th - legal_y - margin * 0.3)
+    for index, unit in enumerate(legal):
+        _place_text_unit(
+            unit, margin, legal_y + index * legal_h,
+            tw - 2.0 * margin, legal_h,
+            max_size=10.0, min_size=5.0,
+        )
+
+    for index, unit in enumerate(decorations):
+        size = min(tw * 0.07, th * 0.035)
+        x = margin if index % 2 == 0 else tw - margin - size
+        _place_group_unit(unit, x, th * 0.28 + index * size, size, size)
 
 
 def _place_text_column(texts, x, y, w, h):

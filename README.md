@@ -16,6 +16,21 @@ overlaid copy; short banners use a compact layout.
 The engine preserves the input elements and their content. It does not
 generate or replace image pixels.
 
+## Design goals and evaluation
+
+The goal is to preserve the design's visual hierarchy, readability, and
+important elements across canvas sizes—not merely stretch the original
+coordinates. The engine keeps grouped elements together, preserves image
+proportions, and changes text size and placement to fit the target while
+keeping the original wording and font family.
+
+Develop and review outputs incrementally: start with common formats and
+nearby aspect ratios, then test wider, taller, and more constrained formats.
+The supplied samples cover three challenge levels, but passing them does not
+guarantee quality on unseen designs. Inspect every rendered PNG at its actual
+size and treat results as a best-effort solution to a deliberately difficult
+layout problem.
+
 ## Requirements
 
 - Python 3.11 (the version used by the supplied Dockerfile)
@@ -84,6 +99,13 @@ The renderer uses the supplied assets in `brand_kit/assets/` and fonts in
 `brand_kit/fonts/`. If a preview shows labeled placeholder boxes rather than
 the actual design, verify that the renderer dependencies installed
 successfully. Do not evaluate layout quality from a placeholder preview.
+
+## Hackathon submission notes
+
+Keep the team's GitHub repository private, as requested in the hackathon
+session notes. Teams seeking technical feedback can contact the Hackathon
+team and should include **"Feedback"** in the email subject line. Follow the
+latest organizer instructions for the submission process and deadline.
 
 ## AI and challenge-rule notes
 
